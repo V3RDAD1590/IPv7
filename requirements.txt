@@ -1,0 +1,3 @@
+cryptography>=42
+pysequoia>=0.1.35
+pyinstaller>=6
