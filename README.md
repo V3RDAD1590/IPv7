@@ -5,8 +5,8 @@ This is for me and my friends, because my art has became a radical talking point
 Invite only for now.
 
 ## Host not included for reasons stated above.
-<img width="1056" height="613" alt="image" src="https://github.com/user-attachments/assets/7fe78bd5-41a4-4bcb-bccc-6a333996ab0d" />
-<img width="1060" height="604" alt="image" src="https://github.com/user-attachments/assets/e1d700cd-fb04-465b-8182-ca71063a0f75" />
+<img width="1039" height="645" alt="image" src="https://github.com/user-attachments/assets/3cd4166f-a1fb-4631-b865-878fa978f1b7" />
+<img width="1039" height="612" alt="image" src="https://github.com/user-attachments/assets/14f29553-d989-4d12-9422-d2f15fc2e337" />
 
 
 
