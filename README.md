@@ -4,8 +4,7 @@ Experimental UDP overlay tunnel using [TP/IX] (IP version 7) addressing.
 [![DOI](https://zenodo.org/badge/1430377404.svg)](https://doi.org/10.5281/zenodo.23652561)
 
 ## Why invite only
-I am what is deemed a "radical artist" because of my refusal to conform to modern audience.
-This way only people who actually follow me can see my art without problems.
+I am what is deemed a "radical artist" because of my refusal to conform to modern audience. This way only people who actually follow me can see my art without problems.
 
 ## Host not included for reasons stated above.
 <img width="1039" height="645" alt="image" src="https://github.com/user-attachments/assets/3cd4166f-a1fb-4631-b865-878fa978f1b7" />
