@@ -661,7 +661,7 @@ class HostBind:
         self.pending = {}
         self.done = {}
         self.throttle = Throttle(clock=clock)
-        self.stats = {"dropped": 0, "cookie_bad": 0, "ticket_bad": 0, "bound": 0, "full": 0, "throttled": 0,
+        self.stats = {"hello": 0, "noise": 0, "dropped": 0, "cookie_bad": 0, "ticket_bad": 0, "bound": 0, "full": 0, "throttled": 0,
                       "resumed": 0}
 
     def _drop(self, why=None):
@@ -681,9 +681,11 @@ class HostBind:
     def handle(self, peer, dgram):
         r = self.reasm.feed(peer, dgram)
         if r is None:
-            return [], None
+            self.stats["noise"] += 1                  # a datagram that is not even a chunk: counted, so an
+            return [], None                           # operator can see that SOMETHING reaches the socket
         mtype, mid, msg = r
         if mtype == HELLO:
+            self.stats["hello"] += 1                  # a first packet of a bind: the same reason
             return self._hello(peer, mid, msg)
         if mtype == HELLO2:
             return self._hello2(peer, mid, msg)

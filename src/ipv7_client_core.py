@@ -51,13 +51,15 @@ class ClientConn:
     off it. Nothing here prints."""
 
     def __init__(self, host, port, cert, pin, ticket, settings=None, clock=time.time, resume=None,
-                 progress=None):
+                 progress=None, rsa_key=None):
         family, self.peer = self._resolve(host, port)
         B.pinned_cert(cert, pin)                 # a wrong pin is refused before any packet, either way
         if resume:
             self.client = B.ClientResume(resume[0], resume[1], progress=progress, clock=clock)
         else:
-            self.client = B.ClientBind(cert, pin, ticket, progress=progress, clock=clock)
+            # rsa_key: made ahead of time by KeyMaker, so the slow part of a bind (RSA-4096 keygen,
+            # seconds on a laptop) is already done when the first packet goes out
+            self.client = B.ClientBind(cert, pin, ticket, rsa_key=rsa_key, progress=progress, clock=clock)
         self.sock = socket.socket(family, socket.SOCK_DGRAM)
         self.sock.settimeout(RECV_TIMEOUT)
         self.settings = settings
@@ -68,7 +70,8 @@ class ClientConn:
         self.transport = Transport(self.sock)
         self.lock = threading.Lock()
         self.pending_app = []
-        self.handlers = {}                       # opcode -> callable(app): claimed on the receive thread
+        self.handlers = {APP_BYE: self._host_bye}   # opcode -> callable(app): claimed on the receive thread
+        self.ended = None                        # set when the host ended the session (a revoked invite)
         self.gateway = None                      # the local name-link gateway, once started (start_gateway)
         self.relay = None
         self.started_at = None
@@ -98,7 +101,15 @@ class ClientConn:
         """Run the bind (or resumption) to its end. -> the Session, or None with `self.client.error`
         set to say why; a host that never answered (it is down, this address is throttled there,
         or it dropped a used invite in silence -- all the same from here, by section 6's own
-        rule) sets `self.timed_out` too. Prints nothing: that is the caller's."""
+        rule) sets `self.timed_out` too. Prints nothing: that is the caller's.
+
+        `timeout` is PER STEP, not for the whole bind (found on the first two-machine run,
+        2026-10-24): it used to be one 10 s window for everything, including the RSA-4096
+        keygen that runs inside the cookie step -- on a slower machine that alone can take
+        most of it, FINISHED then went out just past the deadline, the host redeemed the
+        ticket and sent READY, and nobody was listening any more: "accepts the invite, then
+        times out". Now every message the host answers restarts the window, and the key is
+        normally made before the bind starts (KeyMaker)."""
         try:
             for d in self.client.start():
                 self.sock.sendto(d, self.peer)
@@ -110,8 +121,11 @@ class ClientConn:
                     for d in self.client.resend():
                         self.sock.sendto(d, self.peer)
                     continue
-                for d in self.client.receive(data):
+                out = self.client.receive(data)
+                for d in out:
                     self.sock.sendto(d, self.peer)
+                if out or self.client.session is not None:
+                    end = time.time() + timeout          # the host is answering: a fresh window for the next step
         except OSError as e:
             # "network is unreachable" (an IPv6 host from a machine with no IPv6 route, say),
             # a closed socket, a firewall refusal: a route problem, reported as one
@@ -171,6 +185,17 @@ class ClientConn:
             except Exception:
                 continue
 
+    def _host_bye(self, app):
+        """The host ended this session -- today only one reason: the invite was revoked. Say so at
+        once (above whatever prompt is open) and stop; the Command: loop closes on its next line."""
+        why = app[1:].decode("utf-8", "replace") if len(app) > 1 else ""
+        self.ended = "the host ended this session" + (" (invite %s)" % why if why else "")
+        self.stop.set()
+        try:
+            print("\n   %s -- Enter to close." % self.ended)
+        except Exception:
+            pass
+
     def send_app(self, op, payload=b""):
         frame = self.client.session.tx.seal(app_pack(op, payload))
         self.transport.send(self.mgr.remote, frame)
@@ -228,6 +253,48 @@ def gateway_line(gw):
     if gw.running:
         return gw.url
     return "off (port %d is taken: %s)" % (gw.port, gw.error or "?")
+
+
+class KeyMaker:
+    """Makes the bind's ephemeral RSA-4096 key on a background thread, ahead of time -- while the
+    person is still at the password or the host prompt -- so the bind itself is only network
+    round trips. `begin()` starts one (a no-op while one is ready or being made); `take()` waits
+    for it and hands it over, once. After a login that failed, `begin()` again for the next try."""
+
+    def __init__(self):
+        self.key = None
+        self.thread = None
+        self.lock = threading.Lock()
+
+    def begin(self):
+        with self.lock:
+            if self.key is not None or (self.thread is not None and self.thread.is_alive()):
+                return
+            self.thread = threading.Thread(target=self._make, daemon=True)
+            self.thread.start()
+
+    def _make(self):
+        try:
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            k = rsa.generate_private_key(65537, 4096)
+        except Exception:
+            k = None
+        with self.lock:
+            self.key = k
+
+    @property
+    def ready(self):
+        with self.lock:
+            return self.key is not None
+
+    def take(self, timeout=120.0):
+        self.begin()
+        t = self.thread
+        if t is not None:
+            t.join(timeout)
+        with self.lock:
+            k, self.key = self.key, None
+        return k
 
 
 def list_users(cc, timeout=3.0):
@@ -445,6 +512,9 @@ def _command_loop(cc, out=None, reader=None):
                 if confirm_exit():
                     break
                 continue
+            if getattr(cc, "ended", None):
+                out(MARK_BAD + cc.ended)
+                break
             parts = line.strip().split()
             c = parts[0].lower() if parts else ""
             try:
@@ -555,15 +625,20 @@ def forget_session(path):
         pass
 
 
-def _connect(host, port, cert, fpr, ticket, settings, session_path, progress=None, timeout=10.0):
+def _connect(host, port, cert, fpr, ticket, settings, session_path, progress=None, timeout=10.0, keys=None):
     """One attempt to get a session: resume if IPv7.session matches, else the invite flow; on
     success write IPv7.session for next time. -> (ClientConn or None, BindError or None): the
     error is None on success; the ClientConn is None only when it could not even be built (an
     unresolvable host, a wrong pin), and is already closed when the bind itself failed. Shared
     by both CLIs so the two can never differ in WHEN they resume."""
     resume = resume_for(fpr, ticket, session_path) if session_path else None
+    rsa_key = None
+    if resume is None and keys is not None:
+        if progress and not keys.ready:
+            progress("keygen")                   # the row shows "generating ..." while we wait for it
+        rsa_key = keys.take()
     try:
-        cc = ClientConn(host, port, cert, fpr, ticket, settings, resume=resume, progress=progress)
+        cc = ClientConn(host, port, cert, fpr, ticket, settings, resume=resume, progress=progress, rsa_key=rsa_key)
     except B.BindError as e:
         return None, e
     sess = cc.bind(timeout=timeout)
@@ -622,10 +697,12 @@ def connect_cli(args):
     steps = {"hello": "HELLO sent", "cookie": "cookie received", "keygen": "making the session keys ...",
              "hello2": "HELLO2 sent", "accept": "host signature verified", "finished": "FINISHED sent",
              "resume": "RESUME sent (coming back on the saved session)", "ready": "session ready"}
+    keys = KeyMaker()
+    keys.begin()
     while True:
         try:
             cc, err = _connect(args.host, args.port, cert, fpr, ticket, settings, session_path_for(invite_path),
-                               progress=lambda step: say(MARK_STEP, steps.get(step, step)))
+                               progress=lambda step: say(MARK_STEP, steps.get(step, step)), keys=keys)
             break
         except KeyboardInterrupt:                  # Ctrl-C mid-bind: ask; 'no' tries the bind again
             if confirm_exit():
@@ -706,6 +783,8 @@ class Loading:
         if name == "cookie":
             self._line(row("Cookie", "received"))
         elif name == "keygen":
+            if self.pending == "Session keys":
+                return                                # already shown (KeyMaker's wait came first)
             self.out.write(row("Session keys", "generating ..."))
             if hasattr(self.out, "flush"):
                 self.out.flush()
@@ -748,7 +827,7 @@ class Loading:
         return False
 
 
-def _login_once(args, cert, fpr, ticket, settings, invite_path, sites=()):
+def _login_once(args, cert, fpr, ticket, settings, invite_path, sites=(), keys=None):
     """One pass of the login screen after the gate, -> ClientConn or None. Prints the loading
     rows, the verdict, and on success the adapter blocks (TP/IX first, then UDP6 with the key
     and the login), the gateway row and DONE!."""
@@ -758,7 +837,7 @@ def _login_once(args, cert, fpr, ticket, settings, invite_path, sites=()):
     print()
     loading = Loading()
     cc, err = _connect(args.host, args.port, cert, fpr, ticket, settings, session_path_for(invite_path),
-                       progress=loading.step)
+                       progress=loading.step, keys=keys)
     if not loading.result(cc, err, carrier):
         return None
     sess = cc.client.session
@@ -795,8 +874,11 @@ def banner_connect_cli(args):
     for line in U.PRIVATE_BOX:
         print(line)
     print()
+    keys = KeyMaker()
+    keys.begin()                                  # the RSA-4096 key is made while the person reads and types
     while True:
         try:
+            keys.begin()                          # after a failed try the key was spent: make the next one
             try:
                 input("Enter to assign a TP/IX address...")
             except EOFError:
@@ -827,7 +909,7 @@ def banner_connect_cli(args):
                 args.host, args.port = h, p
                 invite_path = settings.invite
 
-            cc = _login_once(args, cert, fpr, ticket, settings, invite_path, sites)
+            cc = _login_once(args, cert, fpr, ticket, settings, invite_path, sites, keys)
             if cc is None:
                 try:
                     again = input("\nEnter to try again, or q to quit: ").strip().lower()
@@ -1008,6 +1090,55 @@ def selftest():
     Loading(out).result(None, B.BindError("can't resolve host 'nope'", "route"), "nope:7171")
     check("an unresolvable host gives !NO MATCH! (route: ...) with nothing sent",
           "!NO MATCH! (route: can't resolve host 'nope')" in out.getvalue())
+
+    # -- KeyMaker and the per-step deadline
+    km = KeyMaker()
+    km.begin()
+    k1 = km.take()
+    check("KeyMaker makes an RSA-4096 key on a thread and hands it over once",
+          k1 is not None and k1.key_size == 4096 and km.key is None)
+    km.begin()
+    km.begin()
+    check("begin() while one is being made is a no-op, and the next take() gets the next key", km.take() is not None)
+
+    class _SlowBind:
+        """three steps of 0.3 s each against a 0.5 s PER-STEP window: used to fail (one window
+        for everything), must pass now"""
+        def __init__(self):
+            self.session, self.error, self.n = None, None, 0
+
+        def start(self):
+            return [b"s0"]
+
+        def resend(self):
+            return []
+
+        def receive(self, data):
+            time.sleep(0.3)
+            self.n += 1
+            if self.n >= 3:
+                self.session = "SESSION"
+                return []
+            return [b"s%d" % self.n]
+    conn = object.__new__(ClientConn)
+    conn.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    conn.sock.bind(("127.0.0.1", 0))
+    conn.sock.settimeout(RECV_TIMEOUT)
+    conn.peer = conn.sock.getsockname()               # it talks to itself: every datagram sent comes back
+    conn.client = _SlowBind()
+    conn.timed_out = False
+    conn.started_at = None
+    conn.settings = None
+    conn.stop = threading.Event()
+    conn.handlers, conn.gateway, conn.relay, conn.mgr = {}, None, None, None
+    conn.pending_app, conn.lock = [], threading.Lock()
+    t0 = time.time()
+    with mock.patch.object(P, "PathManager", lambda *a, **kw: None):
+        got = conn.bind(timeout=0.5)
+    conn.stop.set()
+    conn.sock.close()
+    check("the bind's timeout is per step: three 0.3 s steps complete under a 0.5 s window (0.9 s in all)",
+          got == "SESSION" and not conn.timed_out and time.time() - t0 >= 0.85)
 
     # -- the Command: loop's new commands, against a stub connection (no socket)
     class _StubConn:

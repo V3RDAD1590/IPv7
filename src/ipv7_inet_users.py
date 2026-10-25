@@ -866,6 +866,20 @@ class Directory:
         rec["carrier"], rec["raw"], rec["seen"], rec["on"] = None, None, None, False
         rec["eth"] = False
 
+    def remove(self, rec):
+        """A revoked user leaves the table entirely (not just offline): ListUsers no longer shows
+        the name, and the TP/IX address goes back to the pool. The ADMIN row cannot be removed."""
+        if rec is None or rec.get("host"):
+            return False
+        self.logout(rec)
+        key = rec["name"].lower()
+        if self.users.get(key) is rec:
+            del self.users[key]
+            if key in self.order:
+                self.order.remove(key)
+            return True
+        return False
+
     def sweep(self, now):
         """the users whose keepalives stopped since the last sweep"""
         gone = [r for r in self.users.values() if not r.get("host") and r["on"] and not self.online(r, now)]

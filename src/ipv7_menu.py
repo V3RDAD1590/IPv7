@@ -46,9 +46,10 @@ class Settings:
         self.link = 0                       # index in LINKS
         self.custom_link = ""
         self.automove = False               # move to Ethernet right after login (O39)
+        self.bind = ""                      # host only: the address it answers from ("" = any)
 
     FIELDS = ("host", "invite", "paths", "device", "ethertype", "custom_ethertype", "link",
-              "custom_link", "automove")
+              "custom_link", "automove", "bind")
 
     def dump(self):
         return "".join("%s %s\n" % (k, int(v) if isinstance(v, bool) else v)
